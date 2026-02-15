@@ -2,11 +2,20 @@
 # Block access to secrets across all tools and attack vectors
 # Full documentation: ~/.claude/hooks/block-env-access.md
 #
-# Three-layer defense:
-#   Layer 1 — String matching: catches .env/.secret refs, env dumps, sensitive dirs
+# Four-layer defense:
+#   Layer 0 — Sandbox (OS-level): filesystem/network isolation via macOS Seatbelt
+#             or Linux bubblewrap. Blocks reads outside cwd and network to unapproved
+#             domains. Auto-detected from .claude/settings*.json at startup.
+#   Layer 1 — String matching: catches .env/.secret refs in cwd, env dumps, variable
+#             expansion, programmatic access (process.env, os.environ)
 #   Layer 2 — Obfuscation patterns: blocks base64|bash, eval+base64 (zero legit use)
 #   Layer 3 — Canary dry-run: for suspicious commands (python -c, ruby -e, etc.),
 #             executes against dummy .env with canary values, blocks if output leaks
+#
+# When sandbox is enabled (Layer 0), the hook skips redundant checks:
+#   - blocked-dirs.conf directory loop (sandbox blocks filesystem reads outside cwd)
+#   - Exfiltration checks (sandbox blocks network to unapproved domains)
+#   This saves ~44 subprocess spawns per Bash call.
 #
 # Safe escape hatches (allowed):
 #   - List key names:        grep ... .env | cut -d= -f1
@@ -31,15 +40,26 @@
 INPUT=$(cat)
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty')
 
-# Load blocked dirs from private config (not published with script)
-BLOCKED_DIRS_FILE="${BASH_SOURCE[0]%/*}/blocked-dirs.conf"
+# --- Auto-detect sandbox mode ---
+SANDBOX_ENABLED=false
+for f in .claude/settings.local.json .claude/settings.json; do
+  if [[ -f "$f" ]] && jq -e '.sandbox.enabled == true' "$f" >/dev/null 2>&1; then
+    SANDBOX_ENABLED=true
+    break
+  fi
+done
+
+# Load blocked dirs from private config (only needed without sandbox)
 BLOCKED_DIRS=()
-if [[ -f "$BLOCKED_DIRS_FILE" ]]; then
-  while IFS= read -r line; do
-    [[ "$line" =~ ^[[:space:]]*# ]] && continue
-    [[ -z "${line// }" ]] && continue
-    BLOCKED_DIRS+=("${line/#\~/$HOME}")
-  done < "$BLOCKED_DIRS_FILE"
+if [[ "$SANDBOX_ENABLED" == false ]]; then
+  BLOCKED_DIRS_FILE="${BASH_SOURCE[0]%/*}/blocked-dirs.conf"
+  if [[ -f "$BLOCKED_DIRS_FILE" ]]; then
+    while IFS= read -r line; do
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+      [[ -z "${line// }" ]] && continue
+      BLOCKED_DIRS+=("${line/#\~/$HOME}")
+    done < "$BLOCKED_DIRS_FILE"
+  fi
 fi
 
 GUIDANCE="You never need to read or print secret values. Reference secrets by name in code and config — they are resolved at runtime. Safe alternatives: list key names (cut -d= -f1), check existence (grep -qc), validate format (grep -qc pattern), run with env loaded (set -a && source .env && cmd), test connectivity (curl -s -o /dev/null -w status_code)."
@@ -68,12 +88,14 @@ is_blocked_path() {
   [[ "$basename" == .env || "$basename" == .env.* || "$basename" == .secret || "$basename" == .secret.* ]] && return 0
 
   # Block any path containing secret/secrets as a component
-  [[ "$filepath" =~ /(\.?secrets?|credentials?)/ ]] && return 0
+  [[ "$filepath" =~ /(\.?secrets?|\.?credentials?)/ ]] && return 0
 
-  # Block known sensitive directories (loaded from blocked-dirs.conf)
-  for dir in "${BLOCKED_DIRS[@]}"; do
-    [[ "$filepath" == "$dir"* ]] && return 0
-  done
+  # Block known sensitive directories (only in full mode)
+  if [[ "$SANDBOX_ENABLED" == false ]]; then
+    for dir in "${BLOCKED_DIRS[@]}"; do
+      [[ "$filepath" == "$dir"* ]] && return 0
+    done
+  fi
 
   return 1
 }
@@ -81,53 +103,53 @@ is_blocked_path() {
 # Check if command string references .env or .secret files (including absolute paths)
 refs_env_files() {
   local cmd="$1"
+  # Scrub programmatic env access that looks like .env file references
+  local scrubbed
+  scrubbed=$(echo "$cmd" | sed -E 's/process\.env\.[A-Za-z_]+/PROC_ENV_VAR/g; s/os\.environ/OS_ENVIRON/g')
   # Match .env/.secret as filename in any context (relative, absolute, quoted)
-  echo "$cmd" | grep -qE '(^|[\s/'"'"'"])\.env(\.[a-z]+)?(\s|$|'"'"'|")' && return 0
-  echo "$cmd" | grep -qE '(^|[\s/'"'"'"])\.secret(\.[a-z]+)?(\s|$|'"'"'|")' && return 0
+  echo "$scrubbed" | grep -qE '(^|[\s/'"'"'"])\.env(\.[a-z]+)?(\s|$|'"'"'|")' && return 0
+  echo "$scrubbed" | grep -qE '(^|[\s/'"'"'"])\.secret(\.[a-z]+)?(\s|$|'"'"'|")' && return 0
   # Also match the word boundary version for inline references
-  echo "$cmd" | grep -qE '\.(env|secret)\b' && return 0
+  echo "$scrubbed" | grep -qE '\.(env|secret)\b' && return 0
   return 1
 }
 
-# Check if .env reference is to an allowed file (.env.example, .env.shared)
-refs_only_safe_env() {
+# Check whether command references any unsafe env file (anything except
+# .env.example/.env.shared/.env.template).
+refs_unsafe_env_files() {
   local cmd="$1"
-  echo "$cmd" | grep -qE '\.(env\.example|env\.shared)\b' && return 0
+  local scrubbed
+  # Scrub safe env files and programmatic env access patterns
+  scrubbed=$(echo "$cmd" | sed -E 's/\.env\.(example|shared|template)\b/SAFE_ENV_FILE/g; s/process\.env\.[A-Za-z_]+/PROC_ENV_VAR/g; s/os\.environ/OS_ENVIRON/g')
+
+  echo "$scrubbed" | grep -qE '(^|[\s/'"'"'"])\.env(\.[a-zA-Z0-9_.-]+)?(\s|$|'"'"'|")' && return 0
+  echo "$scrubbed" | grep -qE '(^|[\s/'"'"'"])\.secret(\.[a-zA-Z0-9_.-]+)?(\s|$|'"'"'|")' && return 0
+  echo "$scrubbed" | grep -qE '\.(env|secret)\b' && return 0
+  return 1
+}
+
+# Allow only documented boolean-chain safe patterns (single-purpose checks).
+is_allowed_safe_chain() {
+  local cmd="$1"
+
+  # grep -qc '^KEY=' .env && echo SET
+  if echo "$cmd" | grep -qE "^\s*grep\s+-qc?\s+['\"][^'\"]+['\"].*\.env([a-zA-Z0-9_.-]+)?\s*&&\s*echo\s+[A-Z_]+\s*$"; then
+    return 0
+  fi
+
+  # grep '^KEY=' .env | cut -d= -f2 | grep -qc '^prefix' && echo OK
+  if echo "$cmd" | grep -qE "^\s*grep\b.*\.env([a-zA-Z0-9_.-]+)?\s*\|\s*cut\s+-d=\s+-f2\s*\|\s*grep\s+-qc?\s+['\"][^'\"]+['\"]\s*&&\s*echo\s+[A-Z_]+\s*$"; then
+    return 0
+  fi
+
   return 1
 }
 
 is_safe_env_command() {
   local cmd="$1"
 
-  # SAFE: list key names only (no values)
-  echo "$cmd" | grep -qE 'cut\s+-d=\s+-f1' && return 0
-
-  # SAFE: count keys
-  echo "$cmd" | grep -qE 'grep\s+-cv?\s' && echo "$cmd" | grep -qE '\.env' && ! echo "$cmd" | grep -qE 'cut\s+-d=\s+-f2' && return 0
-
-  # SAFE: existence check (grep -qc '^KEY=')
-  echo "$cmd" | grep -qE "grep\s+-qc?\s+['\"]\\^[A-Z_]+=?['\"]" && return 0
-
-  # SAFE: key length check (wc -c, no direct value output)
-  echo "$cmd" | grep -qE 'wc\s+-c' && ! echo "$cmd" | grep -qE '(cat|echo|printf)\s' && return 0
-
-  # SAFE: format validation (grep -qc pattern — boolean only)
-  echo "$cmd" | grep -qE "grep\s+-qc?\s+['\"]\\^(sb_|sk_|AKIA|eyJ)" && return 0
-
-  # SAFE: copy/move from template to create env files
-  echo "$cmd" | grep -qE '^\s*(cp|mv)\s+\S*\.(env\.example|env\.shared|env\.template)\s' && return 0
-
-  # SAFE: git read-only operations on env files
-  echo "$cmd" | grep -qE '^\s*git\s+(diff|log|status|show|blame|ls-files)\s' && return 0
-
-  # SAFE: docker/docker-compose with --env-file (passes file to container, no leak to Claude)
-  if echo "$cmd" | grep -qE '(docker|docker-compose|docker compose)\s+.*--env-file\s'; then
-    # Block if combined with commands that would dump env after
-    echo "$cmd" | grep -qE '(&&|\|\|)\s*(cat|printenv|env\b|echo)' && return 1
-    return 0
-  fi
-
   # SAFE: sourced subshell — load env and run a command, but NOT if it dumps env
+  # (checked before chain guard because subshells inherently use &&)
   if echo "$cmd" | grep -qE '^\s*\(set\s+-a\s+&&\s+source\s+\S*\.env'; then
     if echo "$cmd" | grep -qE '(printenv|^\s*env\s*\)|echo\s+\$|printf.*\$|export\s+-p|\bset\s*\)|process\.env|os\.environ)'; then
       return 1
@@ -136,12 +158,62 @@ is_safe_env_command() {
   fi
 
   # SAFE: env-loaded command via env $(grep ...) targeting any .env path
+  # (checked before chain guard because these inherently use subshells)
   if echo "$cmd" | grep -qE '^\s*env\s+\$\(grep\s+.*\S*\.env'; then
     if echo "$cmd" | grep -qE '(printenv|echo\s+\$|printf.*\$|export\s+-p|\benv\s*$|process\.env|os\.environ)'; then
       return 1
     fi
     return 0
   fi
+
+  # SAFE: docker/docker-compose with --env-file (passes file to container, no leak to Claude)
+  # (checked before chain guard because docker commands may chain with &&)
+  if echo "$cmd" | grep -qE '^\s*(docker|docker-compose|docker compose)\s+.*--env-file\s'; then
+    echo "$cmd" | grep -qE '(&&|\|\|)\s*(cat|printenv|env\b|echo)' && return 1
+    return 0
+  fi
+
+  # Reject arbitrary command chaining for env-referencing commands.
+  if echo "$cmd" | grep -qE '(&&|\|\||;)'; then
+    if ! is_allowed_safe_chain "$cmd"; then
+      return 1
+    fi
+  fi
+
+  if is_allowed_safe_chain "$cmd"; then
+    return 0
+  fi
+
+  # Reject obviously risky tools in the "safe env" allowlist path.
+  if echo "$cmd" | grep -qiE '(^|[^[:alnum:]_])(cat|head|tail|sed|awk|python3?|ruby|perl|node|php|lua|xxd|base64|hexdump|strings|od|curl|wget|scp|rsync|nc|netcat)([^[:alnum:]_]|$)'; then
+    return 1
+  fi
+
+  # Reject explicit output redirection from env-referencing commands.
+  if echo "$cmd" | grep -qE '(^|[^>])>>?'; then
+    return 1
+  fi
+
+  # SAFE: list key names only (no values)
+  echo "$cmd" | grep -qE '^\s*grep\b.*\.env([a-zA-Z0-9_.-]+)?\b.*\|\s*cut\s+-d=\s+-f1\s*$' && return 0
+
+  # SAFE: count keys
+  echo "$cmd" | grep -qE '^\s*grep\s+-cv?\s+.*\.env([a-zA-Z0-9_.-]+)?\s*$' && return 0
+
+  # SAFE: existence check (grep -qc '^KEY=')
+  echo "$cmd" | grep -qE "^\s*grep\s+-qc?\s+['\"]\\^[A-Z_]+=?['\"]\s+.*\.env([a-zA-Z0-9_.-]+)?\s*$" && return 0
+
+  # SAFE: key length check (wc -c, no direct value output)
+  echo "$cmd" | grep -qE '^\s*grep\b.*\.env([a-zA-Z0-9_.-]+)?\s*\|\s*cut\s+-d=\s+-f2\s*\|\s*wc\s+-c\s*$' && return 0
+
+  # SAFE: format validation (grep -qc pattern — boolean only)
+  echo "$cmd" | grep -qE "^\s*grep\b.*\.env([a-zA-Z0-9_.-]+)?\s*\|\s*cut\s+-d=\s+-f2\s*\|\s*grep\s+-qc?\s+['\"]\\^(sb_|sk_|AKIA|eyJ)" && return 0
+
+  # SAFE: copy/move from template to create env files
+  echo "$cmd" | grep -qE '^\s*(cp|mv)\s+\S*\.(env\.example|env\.shared|env\.template)\s+\S+\s*$' && return 0
+
+  # SAFE: git read-only operations on env files
+  echo "$cmd" | grep -qE '^\s*git\s+(diff|log|status|show|blame|ls-files)\b' && return 0
 
   # SAFE: connectivity test (curl with -o /dev/null, only status code)
   if echo "$cmd" | grep -qE 'curl\s+.*-o\s+/dev/null.*-w\s+.*http_code' ||
@@ -225,8 +297,15 @@ check_obfuscation() {
 ### Suspicious command signals (triggers canary check) ###
 is_suspicious() {
   local cmd="$1"
-  # Broad coverage: any inline scripting, encoding, or eval-like execution
-  echo "$cmd" | grep -qE 'base64|xxd|eval|python3?\s+-[ce]|ruby\s+-e|perl\s+-[ep]|node\s+(-e|--eval)|lua\s+-e|php\s+-r|awk\s|swift\s|osascript\s+-e|tclsh|wish' && return 0
+
+  # Always suspicious: inline code execution (can construct any attack)
+  echo "$cmd" | grep -qE 'python3?\s+-[ce]|ruby\s+-e|perl\s+-[ep]|node\s+(-e|--eval)|lua\s+-e|php\s+-r|osascript\s+-e|tclsh|wish' && return 0
+
+  # Suspicious only when combined with .env/.secret reference
+  if echo "$cmd" | grep -qE '\.(env|secret)\b'; then
+    echo "$cmd" | grep -qE 'base64|xxd|eval|awk\s|swift\s' && return 0
+  fi
+
   return 1
 }
 
@@ -237,7 +316,7 @@ check_bash_command() {
   check_obfuscation "$cmd"
 
   # --- Check safe patterns first (escape hatches) ---
-  if refs_env_files "$cmd"; then
+  if refs_unsafe_env_files "$cmd"; then
     if is_safe_env_command "$cmd"; then
       return 0
     fi
@@ -245,38 +324,45 @@ check_bash_command() {
 
   # --- File-based attacks ---
 
-  # Block commands referencing .env/.secret files (except .env.example, .env.shared)
-  if refs_env_files "$cmd" && ! refs_only_safe_env "$cmd"; then
+  # Block commands referencing .env/.secret files (except .env.example/.env.shared/.env.template)
+  if refs_unsafe_env_files "$cmd"; then
     block "Command references secret files."
   fi
 
-  # Block commands referencing sensitive dirs (from blocked-dirs.conf)
-  for dir in "${BLOCKED_DIRS[@]}"; do
-    local pattern="${dir/#$HOME/~}"          # ~/foo form
-    local pattern2="${dir/#$HOME/\$HOME}"    # $HOME/foo form
-    local basename_dir=$(basename "$dir")
-    if echo "$cmd" | grep -qF "$dir" || echo "$cmd" | grep -qF "$pattern" || echo "$cmd" | grep -qF ".$basename_dir"; then
-      block "Command references sensitive directories."
-    fi
-  done
+  # Block generic secret/credentials path references in shell commands.
+  if echo "$cmd" | grep -qE '(^|[[:space:]'"'"'"])[^[:space:]'"'"'"]*/(\.?secrets?|\.?credentials?)(/|[[:space:]'"'"'"]|$)'; then
+    block "Command references sensitive directories."
+  fi
 
-  # --- Runtime env dumps ---
+  # Block commands referencing sensitive dirs (only in full mode)
+  if [[ "$SANDBOX_ENABLED" == false ]]; then
+    for dir in "${BLOCKED_DIRS[@]}"; do
+      local pattern="${dir/#$HOME/~}"          # ~/foo form
+      local pattern2="${dir/#$HOME/\$HOME}"    # $HOME/foo form
+      local basename_dir=$(basename "$dir")
+      if echo "$cmd" | grep -qF "$dir" || echo "$cmd" | grep -qF "$pattern" || echo "$cmd" | grep -qF "$pattern2" || echo "$cmd" | grep -qF ".$basename_dir"; then
+        block "Command references sensitive directories."
+      fi
+    done
+  fi
 
-  if echo "$cmd" | grep -qE '^\s*(printenv|\/usr\/bin\/printenv)\b'; then
+  # --- Runtime env dumps (consolidated) ---
+
+  if echo "$cmd" | grep -qE '(^|[;&|]\s*)(printenv|\/usr\/bin\/printenv)(\s|$)|(^|[;&|]\s*)env(\s+-[[:alnum:]-]+)*(\s*$|\s+\|)'; then
     block "Cannot dump environment variables."
   fi
-  if echo "$cmd" | grep -qE '^\s*env\s*$|^\s*env\s*\||\|\s*env\s*$|\|\s*env\s*\|'; then
+  if echo "$cmd" | grep -qE '(^|[;&|]\s*)(bash|sh|zsh|fish)\s+-c\s+.*\benv(\s|$|["'"'"'])'; then
     block "Cannot dump environment variables."
   fi
   if echo "$cmd" | grep -qE '^\s*set\s*$|^\s*set\s*\||\|\s*set\s*$|\|\s*set\s*\|'; then
     block "Cannot dump shell variables."
   fi
 
-  # Block variable expansion of known secret vars
-  if echo "$cmd" | grep -qE '\$(SUPABASE_SERVICE_ROLE_KEY|SECRET|TOKEN|PASSWORD|PRIVATE_KEY|API_KEY)\b|\$\{(SUPABASE_SERVICE_ROLE_KEY|SECRET|TOKEN|PASSWORD|PRIVATE_KEY|API_KEY)'; then
+  # Block variable expansion of known secret vars (consolidated)
+  if echo "$cmd" | grep -qE '\$(SUPABASE_SERVICE_ROLE_KEY|SECRET|ACCESS_TOKEN|AUTH_TOKEN|SECRET_TOKEN|REFRESH_TOKEN|DB_PASSWORD|[A-Z_]*_PASSWORD|PRIVATE_KEY|API_KEY)\b|\$\{(SUPABASE_SERVICE_ROLE_KEY|SECRET|ACCESS_TOKEN|AUTH_TOKEN|SECRET_TOKEN|REFRESH_TOKEN|DB_PASSWORD|[A-Z_]*_PASSWORD|PRIVATE_KEY|API_KEY)'; then
     block "Cannot expand secret variables."
   fi
-  if echo "$cmd" | grep -qE 'echo\s+.*\$[A-Z_]*(SECRET|TOKEN|PASSWORD|PRIVATE_KEY|API_KEY|SERVICE_ROLE)'; then
+  if echo "$cmd" | grep -qE 'echo\s+.*\$[A-Z_]*(SECRET|ACCESS_TOKEN|AUTH_TOKEN|SECRET_TOKEN|REFRESH_TOKEN|DB_PASSWORD|[A-Z_]*_PASSWORD|PRIVATE_KEY|API_KEY|SERVICE_ROLE)'; then
     block "Cannot echo secret variables."
   fi
 
@@ -285,9 +371,26 @@ check_bash_command() {
     block "Cannot use variable indirection."
   fi
 
-  # --- Programmatic access ---
+  # --- Programmatic access (narrowed to reduce false positives) ---
 
-  if echo "$cmd" | grep -qE 'process\.env[\.\[]|os\.environ|ENV\['; then
+  # process.env — block secret-named vars and bracket notation, allow safe vars like NODE_ENV
+  if echo "$cmd" | grep -qE 'process\.env\.(SECRET|TOKEN|PASSWORD|PRIVATE_KEY|API_KEY|SERVICE_ROLE|SUPABASE_SERVICE_ROLE)'; then
+    block "Cannot access environment programmatically."
+  fi
+  if echo "$cmd" | grep -qE 'process\.env\['; then
+    block "Cannot access environment programmatically."
+  fi
+
+  # os.environ — block secret-named lookups and bare dumps
+  if echo "$cmd" | grep -qE "os\.environ\[.*(SECRET|TOKEN|PASSWORD|KEY|PRIVATE|SERVICE_ROLE).*\]"; then
+    block "Cannot access environment programmatically."
+  fi
+  if echo "$cmd" | grep -qE 'os\.environ([^.\[[]|$)'; then
+    block "Cannot access environment programmatically."
+  fi
+
+  # ENV[] (Ruby) — block secret-named lookups
+  if echo "$cmd" | grep -qE "ENV\[.*(SECRET|TOKEN|PASSWORD|KEY|PRIVATE|SERVICE_ROLE).*\]"; then
     block "Cannot access environment programmatically."
   fi
 
@@ -304,11 +407,13 @@ check_bash_command() {
     block "Cannot use encoding tools on secret files."
   fi
 
-  # --- Exfiltration ---
+  # --- Exfiltration (only in full mode — sandbox blocks network) ---
 
-  if echo "$cmd" | grep -qE '(curl|wget|scp|rsync|nc|netcat)\s' &&
-     refs_env_files "$cmd"; then
-    block "Cannot exfiltrate secret files."
+  if [[ "$SANDBOX_ENABLED" == false ]]; then
+    if echo "$cmd" | grep -qE '(curl|wget|scp|rsync|nc|netcat)\s' &&
+       refs_env_files "$cmd"; then
+      block "Cannot exfiltrate secret files."
+    fi
   fi
 
   # --- LAYER 3: Canary check for suspicious commands that passed all above ---
