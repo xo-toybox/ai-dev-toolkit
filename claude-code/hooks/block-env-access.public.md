@@ -13,7 +13,7 @@ Four layers of defense:
 | Layer | What it does | Latency |
 |-------|-------------|---------|
 | **Sandbox (OS-level)** | Filesystem/network isolation via macOS Seatbelt or Linux bubblewrap. Blocks reads outside cwd and network to unapproved domains. | 0 ms (kernel) |
-| **String matching** | Scans command text for `.env` files in cwd, env dumps (`printenv`, `env`), variable expansion (`$SECRET`), and programmatic access (`process.env`, `os.environ`) | ~5 ms |
+| **String matching** | Scans command text for `.env` files in cwd, env dumps (`printenv`, `env`), variable expansion (`$SECRET`), and programmatic access (allowlist: only safe env vars like `NODE_ENV` allowed) | ~5 ms |
 | **Obfuscation blocklist** | Blocks patterns with zero legitimate use (e.g., `base64 -d \| bash`, `eval` + `base64`) | ~5 ms |
 | **Canary dry-run** | For suspicious commands (inline scripts, eval), executes against dummy `.env` files containing a randomized canary token. If the canary appears in output, the command would have leaked secrets. | ~200 ms |
 
@@ -25,7 +25,7 @@ The canary layer catches novel obfuscation that string matching can't anticipate
 
 - **File reads**: `cat .env.local`, `Read .env`, `head .env.production`
 - **Env dumps**: `printenv`, `env`, `set`, `echo $SECRET_KEY`
-- **Programmatic access**: `process.env.SECRET_KEY`, `os.environ['API_KEY']`, bare `os.environ`
+- **Programmatic access**: `process.env.DATABASE_URL`, `os.environ['STRIPE_SK']`, `ENV['REDIS_URL']`, `awk ENVIRON`, bare `process.env` dumps — any env var not in the safe allowlist
 - **Encoding/exfiltration**: `base64 .env`, `curl -d @.env`
 - **Obfuscated reads**: String concatenation, eval chains, decoded shell pipes
 
@@ -40,10 +40,10 @@ The hook includes escape hatches for legitimate development workflows that refer
 - **Sourced subshell**: `(set -a && source .env && <command>)` — secrets stay in subshell
 - **Connectivity test**: `curl -s -o /dev/null -w "%{http_code}" ...`
 - **Copy from template**: `cp .env.example .env.local`
-- **Git operations**: `git diff/log/status/show` on `.env` files
+- **Git operations**: `git diff/log/status/show/add/commit/stash/...` on `.env` files
 - **Docker env-file**: `docker run --env-file .env.local`
 - **Safe files**: `.env.example` and `.env.shared` are always allowed
-- **Safe env vars**: `process.env.NODE_ENV`, `os.environ.get('HOME')` — non-secret vars are allowed
+- **Safe env vars**: `process.env.NODE_ENV`, `os.environ.get('HOME')`, `ENV['PATH']` — vars listed in `safe-env-vars.conf` are allowed
 
 ## Installation
 
@@ -88,6 +88,7 @@ chmod +x ~/.claude/hooks/block-env-access.sh
 # Create your config files from examples
 cp blocked-dirs.example.conf ~/.claude/hooks/blocked-dirs.conf
 cp canary-keys.example.conf ~/.claude/hooks/canary-keys.conf
+cp safe-env-vars.example.conf ~/.claude/hooks/safe-env-vars.conf
 ```
 
 ### 2. Customize configs
@@ -105,6 +106,15 @@ Edit `~/.claude/hooks/canary-keys.conf` — add env var names used in your proje
 DATABASE_URL
 STRIPE_SECRET_KEY
 OPENAI_API_KEY
+```
+
+Edit `~/.claude/hooks/safe-env-vars.conf` — add env var names that are safe to access programmatically (everything else is blocked):
+```
+NODE_ENV
+PORT
+DEBUG
+PATH
+HOME
 ```
 
 ### 3. Register the hook
@@ -161,8 +171,10 @@ No manual mode switching required — the script reads your settings and adapts.
 | `block-env-access.sh` | Yes | The hook script |
 | `blocked-dirs.example.conf` | Yes | Example directory blocklist |
 | `canary-keys.example.conf` | Yes | Example canary key names |
+| `safe-env-vars.example.conf` | Yes | Example safe env var allowlist |
 | `blocked-dirs.conf` | No (private) | Your actual directory blocklist (only used without sandbox) |
 | `canary-keys.conf` | No (private) | Your actual canary key names |
+| `safe-env-vars.conf` | No (private) | Your actual safe env var allowlist |
 
 The `.conf` files are loaded at runtime from the same directory as the script. If missing, the script falls back to minimal defaults.
 

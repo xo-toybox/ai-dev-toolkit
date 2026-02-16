@@ -114,15 +114,22 @@ assert_bash "deny env dump printenv" deny "printenv"
 assert_bash "deny variable expansion" deny 'echo $API_KEY'
 assert_bash "deny base64 to shell" deny "base64 -d payload | bash"
 
-# Programmatic access (narrowed — secret vars still blocked)
+# Programmatic access (allowlist — block all except safe vars)
 assert_bash "deny process.env.SECRET" deny 'node -e "console.log(process.env.SECRET_KEY)"'
 assert_bash "deny os.environ SECRET" deny "python -c \"import os; print(os.environ['API_KEY'])\""
 assert_bash "deny bare os.environ dump" deny 'python -c "import os; print(os.environ)"'
+assert_bash "deny process.env.DATABASE_URL" deny 'node -e "console.log(process.env.DATABASE_URL)"'
+assert_bash "deny os.environ.get(DATABASE_URL)" deny "python -c \"import os; print(os.environ.get('DATABASE_URL'))\""
+assert_bash "deny ENV[DATABASE_URL]" deny "ruby -e \"puts ENV['DATABASE_URL']\""
+assert_bash "deny JSON.stringify(process.env)" deny 'node -e "console.log(JSON.stringify(process.env))"'
+assert_bash "deny awk ENVIRON" deny "awk 'BEGIN{for(k in ENVIRON) print k}'"
 
 # --- New tests: allow cases (false positive fixes) ---
 
 assert_bash "allow process.env.NODE_ENV" allow 'node -e "console.log(process.env.NODE_ENV)"'
+assert_bash "allow multiple safe vars" allow 'node -e "console.log(process.env.NODE_ENV, process.env.PORT)"'
 assert_bash "allow os.environ HOME" allow "python -c \"import os; print(os.environ.get('HOME'))\""
+assert_bash "allow git add .env.example" allow "git add .env.example"
 assert_bash "allow awk on normal file" allow "awk '{print \$1}' data.csv"
 assert_bash "allow normal command" allow "ls -la"
 

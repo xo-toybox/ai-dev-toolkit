@@ -7,7 +7,7 @@
 #             or Linux bubblewrap. Blocks reads outside cwd and network to unapproved
 #             domains. Auto-detected from .claude/settings*.json at startup.
 #   Layer 1 — String matching: catches .env/.secret refs in cwd, env dumps, variable
-#             expansion, programmatic access (process.env, os.environ)
+#             expansion, programmatic access (allowlist: only safe vars allowed)
 #   Layer 2 — Obfuscation patterns: blocks base64|bash, eval+base64 (zero legit use)
 #   Layer 3 — Canary dry-run: for suspicious commands (python -c, ruby -e, etc.),
 #             executes against dummy .env with canary values, blocks if output leaks
@@ -62,6 +62,20 @@ if [[ "$SANDBOX_ENABLED" == false ]]; then
   fi
 fi
 
+# Load safe env vars from config (allowlist for programmatic access)
+SAFE_ENV_VARS_FILE="${BASH_SOURCE[0]%/*}/safe-env-vars.conf"
+SAFE_ENV_RE=""
+if [[ -f "$SAFE_ENV_VARS_FILE" ]]; then
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "${line// }" ]] && continue
+    [[ -n "$SAFE_ENV_RE" ]] && SAFE_ENV_RE+="|"
+    SAFE_ENV_RE+="$line"
+  done < "$SAFE_ENV_VARS_FILE"
+fi
+# Fallback if config missing
+[[ -z "$SAFE_ENV_RE" ]] && SAFE_ENV_RE="NODE_ENV|PORT|DEBUG|PATH|HOME|SHELL|TERM|USER|CI|EDITOR|LANG|TZ|PWD|TMPDIR"
+
 GUIDANCE="You never need to read or print secret values. Reference secrets by name in code and config — they are resolved at runtime. Safe alternatives: list key names (cut -d= -f1), check existence (grep -qc), validate format (grep -qc pattern), run with env loaded (set -a && source .env && cmd), test connectivity (curl -s -o /dev/null -w status_code)."
 
 block() {
@@ -105,7 +119,7 @@ refs_env_files() {
   local cmd="$1"
   # Scrub programmatic env access that looks like .env file references
   local scrubbed
-  scrubbed=$(echo "$cmd" | sed -E 's/process\.env\.[A-Za-z_]+/PROC_ENV_VAR/g; s/os\.environ/OS_ENVIRON/g')
+  scrubbed=$(echo "$cmd" | sed -E 's/process\.env\.[A-Za-z_]+/PROC_ENV_VAR/g; s/process\.env([^.])/PROC_ENV\1/g; s/process\.env$//g; s/os\.environ/OS_ENVIRON/g')
   # Match .env/.secret as filename in any context (relative, absolute, quoted)
   echo "$scrubbed" | grep -qE '(^|[\s/'"'"'"])\.env(\.[a-z]+)?(\s|$|'"'"'|")' && return 0
   echo "$scrubbed" | grep -qE '(^|[\s/'"'"'"])\.secret(\.[a-z]+)?(\s|$|'"'"'|")' && return 0
@@ -120,7 +134,7 @@ refs_unsafe_env_files() {
   local cmd="$1"
   local scrubbed
   # Scrub safe env files and programmatic env access patterns
-  scrubbed=$(echo "$cmd" | sed -E 's/\.env\.(example|shared|template)\b/SAFE_ENV_FILE/g; s/process\.env\.[A-Za-z_]+/PROC_ENV_VAR/g; s/os\.environ/OS_ENVIRON/g')
+  scrubbed=$(echo "$cmd" | sed -E 's/\.env\.(example|shared|template)([^a-zA-Z0-9]|$)/SAFE_ENV_FILE\2/g; s/process\.env\.[A-Za-z_]+/PROC_ENV_VAR/g; s/process\.env([^.])/PROC_ENV\1/g; s/process\.env$//g; s/os\.environ/OS_ENVIRON/g')
 
   echo "$scrubbed" | grep -qE '(^|[\s/'"'"'"])\.env(\.[a-zA-Z0-9_.-]+)?(\s|$|'"'"'|")' && return 0
   echo "$scrubbed" | grep -qE '(^|[\s/'"'"'"])\.secret(\.[a-zA-Z0-9_.-]+)?(\s|$|'"'"'|")' && return 0
@@ -212,8 +226,8 @@ is_safe_env_command() {
   # SAFE: copy/move from template to create env files
   echo "$cmd" | grep -qE '^\s*(cp|mv)\s+\S*\.(env\.example|env\.shared|env\.template)\s+\S+\s*$' && return 0
 
-  # SAFE: git read-only operations on env files
-  echo "$cmd" | grep -qE '^\s*git\s+(diff|log|status|show|blame|ls-files)\b' && return 0
+  # SAFE: git operations on env files (secrets don't leak to Claude's context via git)
+  echo "$cmd" | grep -qE '^\s*git\s+(diff|log|status|show|blame|ls-files|add|commit|stash|checkout|restore|switch|rm|mv|reset|rebase|merge|cherry-pick|branch|tag|push|pull|fetch|clone|init)\b' && return 0
 
   # SAFE: connectivity test (curl with -o /dev/null, only status code)
   if echo "$cmd" | grep -qE 'curl\s+.*-o\s+/dev/null.*-w\s+.*http_code' ||
@@ -359,10 +373,11 @@ check_bash_command() {
   fi
 
   # Block variable expansion of known secret vars (consolidated)
-  if echo "$cmd" | grep -qE '\$(SUPABASE_SERVICE_ROLE_KEY|SECRET|ACCESS_TOKEN|AUTH_TOKEN|SECRET_TOKEN|REFRESH_TOKEN|DB_PASSWORD|[A-Z_]*_PASSWORD|PRIVATE_KEY|API_KEY)\b|\$\{(SUPABASE_SERVICE_ROLE_KEY|SECRET|ACCESS_TOKEN|AUTH_TOKEN|SECRET_TOKEN|REFRESH_TOKEN|DB_PASSWORD|[A-Z_]*_PASSWORD|PRIVATE_KEY|API_KEY)'; then
+  # Uses suffix matching: [A-Z_]*TOKEN catches $TOKEN, $GITHUB_TOKEN, $NPM_TOKEN, etc.
+  if echo "$cmd" | grep -qE '\$(SUPABASE_SERVICE_ROLE_KEY|SECRET|[A-Z_]*TOKEN|[A-Z_]*PASSWORD|PRIVATE_KEY|API_KEY)\b|\$\{(SUPABASE_SERVICE_ROLE_KEY|SECRET|[A-Z_]*TOKEN|[A-Z_]*PASSWORD|PRIVATE_KEY|API_KEY)'; then
     block "Cannot expand secret variables."
   fi
-  if echo "$cmd" | grep -qE 'echo\s+.*\$[A-Z_]*(SECRET|ACCESS_TOKEN|AUTH_TOKEN|SECRET_TOKEN|REFRESH_TOKEN|DB_PASSWORD|[A-Z_]*_PASSWORD|PRIVATE_KEY|API_KEY|SERVICE_ROLE)'; then
+  if echo "$cmd" | grep -qE 'echo\s+.*\$[A-Z_]*(SECRET|TOKEN|PASSWORD|PRIVATE_KEY|API_KEY|SERVICE_ROLE)'; then
     block "Cannot echo secret variables."
   fi
 
@@ -371,26 +386,65 @@ check_bash_command() {
     block "Cannot use variable indirection."
   fi
 
-  # --- Programmatic access (narrowed to reduce false positives) ---
+  # --- Programmatic access (allowlist: block all except safe vars) ---
 
-  # process.env — block secret-named vars and bracket notation, allow safe vars like NODE_ENV
-  if echo "$cmd" | grep -qE 'process\.env\.(SECRET|TOKEN|PASSWORD|PRIVATE_KEY|API_KEY|SERVICE_ROLE|SUPABASE_SERVICE_ROLE)'; then
-    block "Cannot access environment programmatically."
+  # process.env.VAR — scrub safe vars, block if any process.env. remain
+  if echo "$cmd" | grep -qE 'process\.env\.[A-Za-z_]'; then
+    local check_cmd
+    check_cmd=$(echo "$cmd" | sed -E "s/process\.env\.($SAFE_ENV_RE)([^A-Za-z0-9_]|$)/SAFE_PROC_ENV\2/g")
+    if echo "$check_cmd" | grep -qE 'process\.env\.[A-Za-z_]'; then
+      block "Cannot access environment programmatically."
+    fi
   fi
+  # process.env[...] (dynamic — always block, can't determine var name)
   if echo "$cmd" | grep -qE 'process\.env\['; then
     block "Cannot access environment programmatically."
   fi
-
-  # os.environ — block secret-named lookups and bare dumps
-  if echo "$cmd" | grep -qE "os\.environ\[.*(SECRET|TOKEN|PASSWORD|KEY|PRIVATE|SERVICE_ROLE).*\]"; then
+  # Bare process.env (dump via JSON.stringify, Object.keys, etc.)
+  if echo "$cmd" | grep -qE 'process\.env([^.\[A-Za-z_]|$)'; then
     block "Cannot access environment programmatically."
   fi
+
+  # os.environ dump methods — always block
+  if echo "$cmd" | grep -qE 'os\.environ\.(items|values|copy|keys|pop|setdefault|to)'; then
+    block "Cannot access environment programmatically."
+  fi
+  # os.environ[...] — scrub safe vars, block if any remain
+  if echo "$cmd" | grep -qE "os\.environ\["; then
+    local check_cmd
+    check_cmd=$(echo "$cmd" | sed -E "s/os\.environ\[['\"]($SAFE_ENV_RE)['\"]\]/SAFE_OS_ENV/g")
+    if echo "$check_cmd" | grep -qE "os\.environ\["; then
+      block "Cannot access environment programmatically."
+    fi
+  fi
+  # os.environ.get() — scrub safe vars, block if any remain
+  if echo "$cmd" | grep -qE "os\.environ\.get\("; then
+    local check_cmd
+    check_cmd=$(echo "$cmd" | sed -E "s/os\.environ\.get\(['\"]($SAFE_ENV_RE)['\"]\)/SAFE_OS_ENV/g")
+    if echo "$check_cmd" | grep -qE "os\.environ\.get\("; then
+      block "Cannot access environment programmatically."
+    fi
+  fi
+  # Bare os.environ (full dump)
   if echo "$cmd" | grep -qE 'os\.environ([^.\[[]|$)'; then
     block "Cannot access environment programmatically."
   fi
 
-  # ENV[] (Ruby) — block secret-named lookups
-  if echo "$cmd" | grep -qE "ENV\[.*(SECRET|TOKEN|PASSWORD|KEY|PRIVATE|SERVICE_ROLE).*\]"; then
+  # ENV (Ruby) dump methods — always block
+  if echo "$cmd" | grep -qE 'ENV\.(to_h|to_hash|fetch|values|each|select|reject|map|filter|keys|sort)'; then
+    block "Cannot access environment programmatically."
+  fi
+  # ENV[...] — scrub safe vars, block if any remain
+  if echo "$cmd" | grep -qE "ENV\["; then
+    local check_cmd
+    check_cmd=$(echo "$cmd" | sed -E "s/ENV\[['\"]($SAFE_ENV_RE)['\"]\]/SAFE_RUBY_ENV/g")
+    if echo "$check_cmd" | grep -qE "ENV\["; then
+      block "Cannot access environment programmatically."
+    fi
+  fi
+
+  # awk ENVIRON array — always block (dumps process env)
+  if echo "$cmd" | grep -qE '\bENVIRON\b'; then
     block "Cannot access environment programmatically."
   fi
 
