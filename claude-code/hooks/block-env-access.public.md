@@ -17,7 +17,7 @@ Four layers of defense:
 | **Obfuscation blocklist** | Blocks patterns with zero legitimate use (e.g., `base64 -d \| bash`, `eval` + `base64`) | ~5 ms |
 | **Canary dry-run** | For suspicious commands (inline scripts, eval), executes against dummy `.env` files containing a randomized canary token. If the canary appears in output, the command would have leaked secrets. | ~200 ms |
 
-The hook auto-detects whether sandbox is enabled by reading `.claude/settings.local.json` and `.claude/settings.json`. When sandbox is active, redundant checks (blocked-dirs loop, exfiltration detection) are skipped automatically — saving ~44 subprocess spawns per Bash call.
+The hook treats sandbox mode as active only when trusted runtime sandbox signals are present (for example: `CLAUDE_SANDBOX_ENABLED=1`, `CLAUDE_CODE_SANDBOXED=1`, or `CODEX_SANDBOX_ENABLED=1`). When sandbox is active, redundant checks (blocked-dirs loop, exfiltration detection) are skipped automatically — saving ~44 subprocess spawns per Bash call.
 
 The canary layer catches novel obfuscation that string matching can't anticipate (e.g., `python3 -c "open('.e'+'nv').read()"`).
 
@@ -73,7 +73,7 @@ Add sandbox configuration to your `~/.claude/settings.json`:
 }
 ```
 
-The hook will auto-detect sandbox mode and skip redundant checks. You can override per-repo with `.claude/settings.local.json` containing `"sandbox": { "enabled": false }`.
+When the runtime reports sandbox mode, the hook skips redundant checks automatically.
 
 ### 1. Copy files
 
@@ -150,7 +150,7 @@ You should see a block message with guidance on safe alternatives.
 
 ## With Sandbox vs Without Sandbox
 
-The hook auto-detects sandbox mode at startup and adapts its behavior:
+The hook checks trusted runtime sandbox signals at startup and adapts its behavior:
 
 | Check | With Sandbox | Without Sandbox |
 |-------|-------------|-----------------|
@@ -162,7 +162,7 @@ The hook auto-detects sandbox mode at startup and adapts its behavior:
 | Blocked-dirs loop | **Skipped** | Runs |
 | Exfiltration checks | **Skipped** | Runs |
 
-No manual mode switching required — the script reads your settings and adapts.
+No manual mode switching required when your runtime exports sandbox signals.
 
 ## Configuration Files
 
